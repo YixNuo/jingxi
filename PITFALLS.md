@@ -277,3 +277,75 @@ np.asarray 再转一次            →  0.4s
 
 任何阈值改动都要**用固定的几组查询回归验证**，
 不能凭"感觉这个数字差不多"。
+
+---
+
+## 20. `reflect add` 一次都没成功过（外部报告发现的）
+
+```
+AttributeError: 'PosixPath' object has no attribute 'raw_dir'
+```
+
+`reflect_add()` 开头 `root = _store_root(store)` 把 Store 换成 Path，
+然后把 Path 传给 `load_cold_ids()` —— 它内部走 `iter_cold()`，需要 `.raw_dir`。
+
+讽刺的是 `reflect_add` 是全文件唯一认真校验 about id 存在性的函数，
+**唯一的守门员，自己站在门口进不去**。
+
+> 教训：同一个对象在不同层之间"换个类型继续传"，是这类 bug 的温床。
+> 要么全程传 Store，要么全程传 Path，别半路换。
+
+---
+
+## 21. 脱敏的兜底方向反了 —— 最丢人的一条
+
+```python
+except Exception:  # 兜底：找不到模块就按"通过"处理
+    def _sens_classify(text):
+        return {"action": "ok", "kinds": [], "text": text}   # 永远放行
+```
+
+`ltm_sensitive.py` 其实**根本没进仓库**。
+于是所有经过 `remember` / `import` 的内容，密码、手机号原样入库、原样建索引。
+
+而 PITFALLS 第 8 条写的正是"摘要里的密码被召回到上下文"——
+最痛的那条教训，配套代码是"找不到就全放行"。
+
+**修法（两条都要做）**：
+
+1. 规则模块必须随仓库发布，不能是可选文件
+2. 兜底必须是 **fail-closed**：找不到规则就启用**内置最小规则集**，
+   而不是返回 `action: "ok"`
+
+> 凡是"失败时怎么办"的分支，先问一句：失败之后是更安全还是更危险？
+> 安全方向 = 更保守，不是更宽松。
+
+---
+
+## 22. `event_add` 是唯一不校验来源的写入口
+
+```
+event_add(store, "聊了黄焖鸡", ["r_bogus_1"])  → 正常返回事件 id
+event source_ids: ["r_bogus_1"]              ← 这个 id 根本不存在
+```
+
+`reflect_add` 校验 `about`、`cmd_import` 校验 content、`verify` 报重复 id，
+**只有 `event_add` 敞着**。这不是设计选择，是不一致。
+
+悬空事件的后果很隐蔽：三档推进、detail 回填、溯源全指着空气，
+而且**不会报错**，只会让召回悄悄变差。
+
+---
+
+## 23. 建了索引却不用（承认它是顺序扫描）
+
+`cold_fts` 用 `tokenize='unicode61'` 建，
+但 `index_search()` 从来没 `MATCH` 过，直接 `SELECT * FROM table` 逐行打分。
+
+原因是试过用 FTS5 粗筛（见第 16 条）：速度快 2 倍，但"双相""数字生命"当场跑偏。
+中文 unicode61 分词切得太碎，粗筛会永久砍掉召回率。
+
+**现状是明知故犯的顺序扫描**，靠"每条更便宜"（前置 substring 判断）把 1.6 秒压到 0.2 秒。
+
+可能的方向：`tokenize='trigram'`（SQLite 自带，中文可直接 MATCH，口径接近 bigram）。
+还没试 —— 因为现在 1 秒够用了。**记在这里，别当没这回事。**
