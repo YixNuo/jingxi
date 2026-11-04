@@ -787,6 +787,26 @@ def sensitive_guard(text):
     return text, True, []
 
 
+def outbound_scrub(text):
+    """出口脱敏：任何要交给调用方/模型看的正文，都从这里过一遍。
+
+    之所以独立于 sensitive_guard（入库闸）：
+      · 入库时洗的是"要不要建索引"
+      · 出口洗的是"能不能发出去"
+    两个方向都必须洗。只做入库 = 索引干净、输出漏（踩过）。
+    """
+    if not text:
+        return text
+    try:
+        r = _sens_classify(str(text))
+        if r.get("action") == "redact":
+            return r.get("text", text)
+        return text
+    except Exception:
+        # 宁可少给内容，也不原样吐出
+        return "[内容因脱敏失败未展示]"
+
+
 def cmd_remember(store, args):
     """把一条原始对话写入冷层并同步索引。"""
     store.ensure()
@@ -2443,6 +2463,12 @@ def recall(store, query, budget_tokens=1200, k=10, layers=None, reveal=False):
                 it["content"] = text2
                 it["note"] = "cold·按线索翻出"
 
+    # 出口脱敏：cold 正文来自 raw 原文，入库时洗过索引但没洗正文，
+    # 这里必须再过一遍，否则召回输出就是把密码直接递给模型。
+    for it in pack:
+        if isinstance(it, dict) and it.get("content"):
+            it["content"] = outbound_scrub(it["content"])
+
     _touch_hot(root, pack)
     meta["dropped"] = dropped
     return {"pack": pack, "tokens_used": used, "budget": budget, "meta": meta}
@@ -2856,7 +2882,9 @@ def think_timeline(store, topic):
     if key:
         rows = [r for r in rows if str(r.get("topic") or "").strip().lower() == key]
     rows.sort(key=_think_sort_key)
-    return rows
+    # 思考里可能复述过原文
+    return [dict(r, thought=outbound_scrub(r.get("thought")))
+            if isinstance(r, dict) else r for r in rows]
 
 
 def think_about(store, cold_id):
@@ -2872,7 +2900,9 @@ def think_about(store, cold_id):
         if cid in about:
             rows.append(rec)
     rows.sort(key=_think_sort_key)
-    return rows
+    # 思考里可能复述过原文
+    return [dict(r, thought=outbound_scrub(r.get("thought")))
+            if isinstance(r, dict) else r for r in rows]
 
 
 # ---------------------------------------------------------------
@@ -3452,7 +3482,8 @@ def event_render(store, mid, now=None, reveal=False):
         text = rec.get("detail") or ""
         note = ""
 
-    return {"id": mid, "stage": stage, "text": text, "note": note}
+    # 出口脱敏：detail 是原文摘录，可能带凭据
+    return {"id": mid, "stage": stage, "text": outbound_scrub(text), "note": note}
 
 def advance_stages(store, now=None):
     """把 stage_for 的计算结果写回 events.jsonl —— 唯一让 stage 落盘的入口。
@@ -3515,7 +3546,7 @@ def event_search(store, query, k=10, now=None):
         hits.append({
             "id": mid,
             "stage": stage,
-            "text": text,
+            "text": outbound_scrub(text),
             "score": score,
             "note": note,
         })
