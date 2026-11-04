@@ -1,18 +1,19 @@
-# 鲸汐 · JingXi
+<p align="center">
+  <img src="assets/cover.jpg" width="100%" alt="鲸汐 · JingXi">
+</p>
 
-> 一只记得潮汐的鲸。
-> 潮水把你说过的话一遍遍推回岸边 —— 那叫想起来。
+<h1 align="center">鲸汐 · JingXi</h1>
 
-**一个"原文永不改"的长期记忆库。** 纯 Python 标准库，零依赖，单文件引擎。
+<p align="center"><em>一只记得潮汐的鲸。<br>
+潮水把你说过的话一遍遍推回岸边 —— 那叫想起来。</em></p>
 
-```bash
-python3 ltm2.py remember "她说排骨汤要焯水，冷水下锅" --role user --session s1
-python3 ltm2.py recall   "那次熬汤"        # 说错一个字也能找到
-python3 ltm2.py cue      "在吗"            # {"allow": false} —— 这会儿不该翻旧账
-python3 ltm2.py event    list              # 一段对话 = 一件事
-```
+<p align="center">
+  <strong>一个「原文永不改」的长期记忆库</strong><br>
+  纯 Python 标准库 · 零依赖 · 单文件引擎 · 可选向量加速
+</p>
 
 ---
+
 
 ## 为什么做它
 
