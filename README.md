@@ -25,8 +25,16 @@
 python3 ltm2.py remember "她说排骨汤要焯水，冷水下锅" --role user --session s1
 python3 ltm2.py recall   "那次熬汤"        # 说错一个字也能找到
 python3 ltm2.py cue      "在吗"            # {"allow": false} —— 这会儿不该翻旧账
-python3 ltm2.py event    list              # 一段对话 = 一件事
+
+# 看看各层里有什么
+python3 ltm2.py event    list --k 10       # 事件，按时间倒序
+python3 ltm2.py hot      list              # 热层（近期反复提到、还没了结的）
+python3 ltm2.py reflect  list              # 反射层
+python3 ltm2.py fixed    list              # 固定层
 ```
+
+> 注意：`event` 只有 `add / summary / show / advance / search / list`，
+> 没有 `event show` 之外的命名子命令。查不到时先 `list` 看一眼。
 
 ---
 
