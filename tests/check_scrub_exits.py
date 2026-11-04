@@ -101,8 +101,60 @@ def main():
         print("\nRESULT: FAIL")
         return 1
 
+    idx_ok = check_index_writes(path)
+    if not idx_ok:
+        print("\nRESULT: FAIL")
+        return 1
+
     print("\nRESULT: PASS")
     return 0
+
+
+
+
+# ---------------------------------------------------------------------------
+# 第二项检查：索引写入点是否都过了入库脱敏
+# ---------------------------------------------------------------------------
+
+INDEX_TABLES = ("cold_fts", "fixed_fts", "hot_fts", "refl_fts", "event_fts", "thought_fts")
+
+
+def check_index_writes(path):
+    """所有往 FTS 表写内容的调用，都必须经过 _index_safe / sensitive_guard。
+
+    这条是外部报告抓到的：rebuild_index 从 raw 重建索引，
+    如果重建时不洗，跑一次 rebuild 就把之前洗干净的索引还原成原文了。
+    """
+    src = open(path, encoding="utf-8").read()
+    lines = src.splitlines()
+    problems = []
+    for m in re.finditer(r"index_put\([^\n]+\)", src):
+        call = m.group(0)
+        ln = src[:m.start()].count("\n") + 1
+        if not any(t in call for t in INDEX_TABLES):
+            continue
+        if "_index_safe(" in call or "sensitive_guard" in call or ", clean)" in call:
+            continue
+        problems.append((ln, call[:100]))
+
+    # event_fts / thought_fts 是直接 execute 写的，单独看一眼
+    for m in re.finditer(r"INSERT INTO (event_fts|thought_fts)\([^)]*\)[^\n]*", src):
+        ln = src[:m.start()].count("\n") + 1
+        # 看这个 INSERT 前后各 8 行：脱敏可能写在上一句（safe = _index_safe(text)）
+        start_line = max(0, ln - 9)
+        end_line = min(len(lines), ln + 8)
+        window = "\n".join(lines[start_line:end_line])
+        if "_index_safe(" in window:
+            continue
+        problems.append((ln, window.strip().splitlines()[-3:]))
+
+    if problems:
+        print("\n✗ 索引写入未脱敏：")
+        for ln, call in problems:
+            print("   行 %-5d %s" % (ln, call))
+        return False
+    print("\n✓ 所有索引写入点都过了脱敏")
+    return True
 
 
 if __name__ == "__main__":
