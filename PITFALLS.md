@@ -349,3 +349,49 @@ event source_ids: ["r_bogus_1"]              ← 这个 id 根本不存在
 
 可能的方向：`tokenize='trigram'`（SQLite 自带，中文可直接 MATCH，口径接近 bigram）。
 还没试 —— 因为现在 1 秒够用了。**记在这里，别当没这回事。**
+
+---
+
+## 24. 开源出去之后，别人会踩的第一个坑
+
+我们自己的环境是"跑了一整天、手动补了三轮"才凑齐的，
+所以很自然地以为**装了插件就有全部功能**。
+
+真实情况：
+
+```
+插件负责   每轮写原话        （自动，装完就有）
+没人负责   切段/摘要/事件/向量 （要自己跑 pipeline）
+```
+
+结果别人装完，库里只有原话，**摘要层是空的**。
+原话能查，"换个说法"就找不到 —— 正好复现本项目想解决的那个问题。
+
+**修法**：README 顶部就写清"完整安装 = 插件 + 定时跑 pipeline"，
+并且把整条 pipeline 的脚本一起发给人家，不能只给引擎。
+
+> 交付一个"能跑起来的最小闭环"，不是交付"我这边能跑的代码"。
+> 差别就在那些你手动做过、但从没写下来的步骤。
+
+---
+
+## 25. 脚本里写死自己的绝对路径
+
+`pipeline/` 那批脚本原本全是：
+
+```python
+ROOT = "/root/.hermes/ltm2"
+SEGS = "/root/ltm-segments.jsonl"
+CLI  = ["python3", "/root/ltm2.py", "--root", ROOT]
+```
+
+在我这台机器上跑得好好的，换个人装就是 `FileNotFoundError`。
+
+**修法**：所有路径走环境变量 + 相对自身位置推导：
+
+```python
+ROOT = os.environ.get("LTM_ROOT", os.path.expanduser("~/.ltm"))
+CLI  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "ltm2.py")
+```
+
+> 本地脚本变成别人能用的工具，这一步是必须的，不能省。
