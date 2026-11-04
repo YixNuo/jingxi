@@ -1,3 +1,19 @@
+<p align="center">
+  <img src="assets/cover.jpg" width="100%" alt="鲸汐 · JingXi">
+</p>
+
+<h1 align="center">鲸汐 · JingXi</h1>
+
+<p align="center"><em>一只记得潮汐的鲸。<br>
+潮水把你说过的话一遍遍推回岸边 —— 那叫想起来。</em></p>
+
+<p align="center">
+  <strong>一个「原文永不改」的长期记忆库</strong><br>
+  纯 Python 标准库 · 零依赖 · 单文件引擎 · 可选向量加速
+</p>
+
+---
+
 # 鲸汐 · JingXi
 
 > 一只记得潮汐的鲸。
