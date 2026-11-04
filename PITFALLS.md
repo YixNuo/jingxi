@@ -380,7 +380,7 @@ event source_ids: ["r_bogus_1"]              ← 这个 id 根本不存在
 `pipeline/` 那批脚本原本全是：
 
 ```python
-ROOT = "/root/.hermes/ltm2"
+ROOT = os.environ.get("LTM_ROOT", "~/.ltm")
 SEGS = "/root/ltm-segments.jsonl"
 CLI  = ["python3", "/root/ltm2.py", "--root", ROOT]
 ```
@@ -395,3 +395,55 @@ CLI  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "ltm2.py")
 ```
 
 > 本地脚本变成别人能用的工具，这一步是必须的，不能省。
+
+---
+
+## 26. 脱敏只洗了索引，没洗召回输出（外部报告发现的第二条）
+
+上一版的脱敏闸门做在**入库**这一步：
+
+```python
+clean, indexable, kinds = sensitive_guard(content)
+index_put(conn, "cold_fts", "rid", rec["id"], clean)   # 索引里是干净的
+append_jsonl(store.raw_file(rec["ts"]), rec)           # 原文照写（故意的）
+```
+
+于是验证的时候我只看索引，看到 `密码 [已隐去]`，就宣布"脱敏通过"。
+
+**但召回输出是从 `raw/` 读原文的**：
+
+```
+$ recall "服务器密码" --reveal
+[cold] 我的服务器密码是 TestAbc12345，记一下      ← 原样吐出来了
+```
+
+索引干净、档案肯留，这都没错；错的是**出口没有任何一道闸**。
+而出口正是交给模型的那一段。
+
+**修法**：加 `outbound_scrub()`，把所有对外返回路径统一过一遍：
+
+| 出口 | 修了什么 |
+|---|---|
+| `recall()` 装包后 | 每条 content 过 scrub |
+| `event_render()` | text 过 scrub |
+| `event_search()` | text 过 scrub |
+| `think_timeline()` | thought 过 scrub |
+
+> 入库和出口是两个方向，两边都必须洗。
+> **只洗一边，等于把"防外发"做成"防自己看见"。**
+
+**验证方式也得改**：不能只看索引，要看**真实返回的内容**。
+这次我拿一个假密码写进去，分别测了 recall / event show / event search 三条出口。
+
+---
+
+## 27. 验证要看"用户拿到的东西"，不是"数据库里存的东西"
+
+第 26 条本质上是同一个毛病的第二次犯：
+**我验证的是我以为的那一层，而不是真正交付的那一层。**
+
+遇到"改了一个安全机制"时，别问"数据源干净了吗"，
+要问"**最终给出去的那串字节里还有没有它**"。
+
+这也是 PITFALLS 第 10 条（先验证写入有发生）的同一类错误：
+验证点选错了，通过也是假的。
