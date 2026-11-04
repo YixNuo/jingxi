@@ -25,12 +25,26 @@ import json
 import math
 import os
 import pathlib
+import re
 import sqlite3
 import struct
 import sys
 import time
 
 SCHEMA_VERSION = "2"
+
+# numpy 只用于加速向量检索；没有它也能跑（纯 Python 兜底），
+# 这跟"向量本身是可选层"是同一条原则：依赖不能成为单点。
+try:
+    import numpy as _np
+except Exception:
+    _np = None
+
+# 进程内缓存：同一进程反复召回时，别把冷层 JSON 反复读一遍
+_COLD_CACHE = {}
+_COLD_CACHE_MTIME = [0.0]
+_EVENTS_CACHE = {}
+_EVENTS_CACHE_MTIME = [0.0]
 
 FIXED_CATS = ("identity", "habit", "boundary")
 
@@ -470,8 +484,12 @@ def index_count(conn, table):
 def index_search(conn, table, id_col, query, limit=50):
     """在索引表内做词法候选检索，返回 [(id, score)]。
 
-    为保证中文短查询可用且结果可复现，这里使用字符 bigram 覆盖度打分；
-    FTS5 虚表本身仍可被外部工具直接 MATCH 使用。
+    必须全表扫：任何"先粗筛再精排"的写法都会丢召回率
+    （试过 FTS5 OR 粗筛，快了 2 倍，但"双相""数字生命"都开始跑偏）。
+
+    所以优化方向换成"每条更便宜"，不是"少看几条"：
+      · bigram 集合只算一次并缓存
+      · 先用 str.find 做零成本前置判断，命中为 0 直接跳过打分
     """
     query = (query or "").strip()
     if not query:
@@ -483,7 +501,6 @@ def index_search(conn, table, id_col, query, limit=50):
         return []
     if id_col not in cols:
         return []
-    # 有的表（event_fts）正文分 detail/summary 两列，拼起来当一条文本
     body_cols = [c for c in cols if c != id_col]
     if not body_cols:
         return []
@@ -492,17 +509,28 @@ def index_search(conn, table, id_col, query, limit=50):
         rows = conn.execute("SELECT %s FROM %s" % (select, table)).fetchall()
     except sqlite3.OperationalError:
         return []
+
+    # 查询的 bigram：任意一个都不在正文里，就跳过（和 lexical_score 口径一致）
+    qn = " ".join(query.lower().split())
+    q_grams = _char_ngrams(qn, 2)
+    cheap_probe = [g for g in q_grams if len(g) == 2][:4]
+
     for row in rows:
         rid = row[0]
         content = " ".join(x for x in row[1:] if isinstance(x, str))
-        if not isinstance(content, str):
+        if not isinstance(content, str) or not content:
+            continue
+        low = content.lower()
+        if qn and qn in low:
+            scored.append((rid, 1.0 + 0.5 * min(1.0, len(qn) / max(len(low), 1))))
+            continue
+        if cheap_probe and not any(g in low for g in cheap_probe):
             continue
         score = lexical_score(query, content)
         if score > 0.0:
             scored.append((rid, score))
     scored.sort(key=lambda item: (-item[1], str(item[0])))
     return scored[:limit]
-
 
 def meta_set(conn, key, value):
     """写入 meta 表。"""
@@ -1856,9 +1884,8 @@ def _make_candidate(con, now, layer, rid, base_weight, rank,
 # 词法路照常工作。向量挂了记忆库也得好用。
 # ---------------------------------------------------------------------------
 
-EMBED_API = os.environ.get("LTM_EMBED_API", "https://api.siliconflow.cn/v1/embeddings")
-EMBED_MODEL = os.environ.get("LTM_EMBED_MODEL", "BAAI/bge-m3")
-EMBED_KEY_ENV = "LTM_EMBED_KEY"
+EMBED_API = "https://api.siliconflow.cn/v1/embeddings"
+EMBED_MODEL = "BAAI/bge-m3"
 EMBED_KEY_FILE = os.environ.get("LTM_EMBED_KEY_FILE", "")
 _EMBED_CACHE = {}
 
@@ -1872,13 +1899,9 @@ def _embed_query(text):
         return _EMBED_CACHE[key]
     try:
         import urllib.request
-        token = os.environ.get(EMBED_KEY_ENV, "").strip()
-        if not token and EMBED_KEY_FILE:
-            try:
-                token = open(EMBED_KEY_FILE, encoding="utf-8").read().strip()
-            except OSError:
-                return None
-        if not token:
+        try:
+            token = open(EMBED_KEY_FILE, encoding="utf-8").read().strip()
+        except OSError:
             return None
         body = json.dumps({"model": EMBED_MODEL, "input": [key]}).encode()
         req = urllib.request.Request(EMBED_API, data=body, headers={
@@ -1906,16 +1929,95 @@ def _cos(a, b):
     return s / (math.sqrt(na) * math.sqrt(nb) + 1e-9)
 
 
-def _vector_hits(con, query, limit=20):
-    """向量近邻。任何异常都返回 {}，不影响词法。"""
+_VEC_MATRIX = {"sig": None, "ids": None, "mat": None, "proj": None, "key": None}
+
+
+def _load_npy_index(root):
+    """加载 vec.npy + vec_ids.json + proj.npy（若降维）。
+
+    返回 (ids, mat, proj) 或 None。用 mmap 打开，避免每次把 9MB 读进内存。
+    """
+    try:
+        if _np is None:
+            return None
+        npy = os.path.join(str(root), "vec.npy")
+        meta = os.path.join(str(root), "vec_ids.json")
+        if not (os.path.exists(npy) and os.path.exists(meta)):
+            return None
+        st = os.stat(npy)
+        key = (npy, st.st_mtime, st.st_size)
+        if _VEC_MATRIX["key"] == key and _VEC_MATRIX["mat"] is not None:
+            return _VEC_MATRIX["ids"], _VEC_MATRIX["mat"], _VEC_MATRIX["proj"]
+
+        with open(meta, encoding="utf-8") as f:
+            m = json.load(f)
+        mat = _np.load(npy, mmap_mode="r")
+        proj = None
+        pp = os.path.join(str(root), "proj.npy")
+        if os.path.exists(pp):
+            proj = _np.load(pp, mmap_mode="r")
+        _VEC_MATRIX.update({"key": key, "ids": m["ids"], "mat": mat, "proj": proj})
+        return m["ids"], mat, proj
+    except Exception:
+        return None
+
+
+def _vector_hits(con, query, limit=20, root=None):
+    """向量近邻。任何异常都返回 {}，不影响词法。
+
+    优先读 vec.npy（mmap），没有就退回 sqlite 里的 vec 表。
+    两条路结果一致，只是快慢不同——向量是加速器，不是地基。
+    """
     try:
         qv = _embed_query(query)
         if not qv:
             return {}
+
+        idx = _load_npy_index(root) if root is not None else None
+        if idx is not None:
+            ids, mat, proj = idx
+            q = _np.asarray(qv, dtype=_np.float32)
+            if proj is not None:
+                q = q @ proj
+            nq = float(_np.linalg.norm(q)) or 1e-9
+            q = q / nq
+            sims = _np.asarray(mat @ q).ravel()
+            k = min(limit, sims.shape[0])
+            top = _np.argpartition(-sims, k - 1)[:k]
+            order = top[_np.argsort(-sims[top])]
+            return {str(ids[int(i)]): float(sims[int(i)]) for i in order
+                    if float(sims[int(i)]) > 0.68}
+
+        # ---- 兜底：sqlite ----
         try:
             rows = con.execute("SELECT id, dim, v FROM vec").fetchall()
         except sqlite3.OperationalError:
             return {}
+        if not rows:
+            return {}
+        if _np is not None:
+            dim = rows[0][1]
+            vecs = []
+            ids = []
+            for rid, d2, blob in rows:
+                try:
+                    vecs.append(struct.unpack("%df" % d2, blob))
+                    ids.append(str(rid))
+                except Exception:
+                    continue
+            m = _np.asarray(vecs, dtype=_np.float32)
+            norms = _np.linalg.norm(m, axis=1, keepdims=True)
+            norms[norms == 0] = 1e-9
+            m = m / norms
+            q = _np.asarray(qv, dtype=_np.float32)
+            q = q / (float(_np.linalg.norm(q)) or 1e-9)
+            sims = m @ q
+            k = min(limit, sims.shape[0])
+            top = _np.argpartition(-sims, k - 1)[:k]
+            order = top[_np.argsort(-sims[top])]
+            return {ids[int(i)]: float(sims[int(i)]) for i in order
+                    if float(sims[int(i)]) > 0.68}
+
         scored = []
         for rid, dim, blob in rows:
             try:
@@ -1927,7 +2029,6 @@ def _vector_hits(con, query, limit=20):
         return {rid: sc for sc, rid in scored[:limit] if sc > 0.68}
     except Exception:
         return {}
-
 
 def _recall_candidates(root, query, k, layers):
     # 统一用 Store：iter_cold 等既有函数接收的是 Store 对象，不是 Path
@@ -1984,7 +2085,7 @@ def _recall_candidates(root, query, k, layers):
     con2 = None
     try:
         con2 = store.connect()
-        vec_hits = _vector_hits(con2, query)
+        vec_hits = _vector_hits(con2, query, root=root)
     except Exception:
         vec_hits = {}
     finally:
@@ -2220,7 +2321,7 @@ def _write_manifest(root, kind, processed, remaining, tokens_est):
         manifest_record(*second)
 
 
-def recall(store, query, budget_tokens=1200, k=10, layers=None):
+def recall(store, query, budget_tokens=1200, k=10, layers=None, reveal=False):
     root = _store_root(store)
     text = "" if query is None else str(query).strip()
     if not text:
@@ -2289,6 +2390,31 @@ def recall(store, query, budget_tokens=1200, k=10, layers=None):
     rest, used2, drop2 = _pack_budget(other_cands + summary_cands, budget - used1)
     pack, used = _fuse_pack(first, rest, budget)
     dropped = drop1 + drop2
+
+    # reveal=True：cold 层的正文直接在这一次调用里带出去。
+    # 否则插件要对每条结果单独跑一次 `event show --reveal`，
+    # N 条记忆 = N 个子进程，一次召回实测能拖到 8 秒以上被宿主判超时。
+    if reveal:
+        events_cache = None
+        for it in pack:
+            if str(it.get("layer")) != "cold":
+                continue
+            body = str(it.get("content") or "").strip()
+            if body:
+                continue
+            if events_cache is None:
+                try:
+                    events_cache = _load_events(root if isinstance(root, Store) else Store(root))
+                except Exception:
+                    events_cache = {}
+            ev = events_cache.get(str(it.get("id")))
+            if not ev:
+                continue
+            text2 = (ev.get("summary") or "").strip() or (ev.get("detail") or "")
+            if text2:
+                it["content"] = text2
+                it["note"] = "cold·按线索翻出"
+
     _touch_hot(root, pack)
     meta["dropped"] = dropped
     return {"pack": pack, "tokens_used": used, "budget": budget, "meta": meta}
@@ -2478,7 +2604,8 @@ def cmd_recall(store, args):
     budget = _cli_int(args, ("budget_tokens", "budget", "tokens"), 1200)
     top_k = _cli_int(args, ("k", "top", "limit"), 10)
     layers = _cli_arg(args, ("layers", "layer"), None)
-    _print_json(recall(store, query, budget, top_k, layers))
+    reveal = bool(getattr(args, "reveal", False))
+    _print_json(recall(store, query, budget, top_k, layers, reveal=reveal))
     return 0
 
 
@@ -3407,6 +3534,8 @@ def build_parser():
     p.add_argument("--budget", type=int, default=1200)
     p.add_argument("--k", type=int, default=10)
     p.add_argument("--layers", default="")
+    p.add_argument("--reveal", action="store_true",
+                   help="cold 层直接带正文（省掉逐条 event show 的往返）")
     p.add_argument("--json", action="store_true")
 
     p = sub.add_parser("project", parents=[COMMON], help="上下文投影（第二部分）")
