@@ -17,6 +17,13 @@ import os
 import re
 import sys
 
+# Windows 的 GBK 控制台打印 ✓ / ✗ 会抛 UnicodeEncodeError（结果其实是 PASS）。
+# 先把 stdout 换成一个不会崩的编码。
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 DEFAULT = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "ltm2.py")
 
