@@ -230,6 +230,81 @@ python3 examples/build_vec.py --root ~/.ltm
 
 ---
 
+---
+
+## 完整安装：插件只管写，摘要要另跑
+
+**这是最容易踩的坑**：只装插件，库里只有原话，没有摘要。
+原话能查，但"换个说法"就找不到 —— 摘要层是空的。
+
+完整链路是两段：
+
+```
+实时   每轮对话 → 插件写原话（自动，不用管）
+离线   切段 → 摘要 → 回填事件 → 导向量（要自己跑）
+```
+
+### 一条命令跑完离线部分
+
+```bash
+export LTM_ROOT=~/.ltm
+export LTM_LLM_API=https://api.openai.com/v1/chat/completions
+export LTM_LLM_KEY=你的key
+export LTM_LLM_MODELS=gpt-4o-mini
+
+python3 pipeline/ltm_cycle.py          # 全跑
+python3 pipeline/ltm_cycle.py --no-vec # 跳过向量
+```
+
+它会依次执行：
+
+| 步骤 | 脚本 | 干什么 |
+|---|---|---|
+| 切段 | `ltm_segment.py` | 一段对话 = 一件事，按空档和起头词切 |
+| 摘要 | `ltm_summarize2.py` | 每段 60~120 字，多模型轮换 + 并发 |
+| 回填 | `ltm_backfill_events.py` | 摘要挂进事件层，三档生命开始走 |
+| 向量 | `ltm_build_vec.py` | 给原话和摘要建 embedding（可选） |
+| 导出 | `ltm_export_vec.py` | 导出 .npy + 随机投影降维（可选） |
+
+### 挂定时，否则会一直缺
+
+```bash
+# Hermes 里：
+hermes cron add "every day at 3am" --script pipeline/ltm_cycle.py --no-agent
+
+# 或者系统 crontab：
+0 3 * * * cd /path/to/jingxi && LTM_ROOT=~/.ltm python3 pipeline/ltm_cycle.py
+```
+
+**不挂定时就是这个结果**：原话一直涨，摘要永远停在最后跑的那天。
+时间越久，"换个说法就找不到"的问题越明显。
+
+### 全部脚本都是幂等的
+
+重复跑不会重复切段、不会重复写摘要、不会重复建事件。
+断了就再跑一遍，从断的地方接着来。
+
+---
+
+## 目录结构
+
+```
+jingxi/
+├── ltm2.py                      引擎（单文件，零依赖）
+├── ltm_sensitive.py             写入前的凭证脱敏规则
+├── pipeline/
+│   ├── ltm_segment.py           切段
+│   ├── ltm_summarize2.py        摘要
+│   ├── ltm_backfill_events.py   回填事件层
+│   ├── ltm_build_vec.py         建向量
+│   ├── ltm_export_vec.py        导出 .npy
+│   ├── ltm_cycle.py             串联以上全部
+│   └── ltm_scrub.py             摘要脱敏
+└── examples/hermes-plugin/      Hermes MemoryProvider 适配器
+```
+
+---
+
 ## 一句话
 
 > **宁可少记一件事，不可把记下的那件事改错。**
