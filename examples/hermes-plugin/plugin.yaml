@@ -1,0 +1,3 @@
+name: ltm-memory
+version: "0.1.0"
+description: "ltm-memory — 自建长期记忆（原文永不改 + 事件三档 + 思考层 + 线索门控）。零依赖，纯标准库 CLI 后端。"
