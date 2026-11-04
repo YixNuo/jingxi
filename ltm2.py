@@ -803,6 +803,26 @@ def scrub_pack(pack):
     return pack
 
 
+def _index_safe(text):
+    """索引层要存的那份内容：过入库脱敏。
+
+    存在的理由：raw/ 里是原文（故意的），而 rebuild_index 是从 raw 重建索引。
+    所以 rebuild 必须在这里洗一遍，否则"跑一次重建"就把索引里的 [已隐去]
+    全部还原成原文——之前的清洗白做，而且没人会发现。
+
+    这正是 PITFALLS 里那条：安全机制不能只修"当前状态",还要修"重建路径"。
+    """
+    if not text:
+        return text
+    try:
+        r = _sens_classify(str(text))
+        if r.get("action") == "redact":
+            return r.get("text", text)
+        return text
+    except Exception:
+        return text
+
+
 def outbound_scrub(text):
     """出口脱敏：任何要交给调用方/模型看的正文，都从这里过一遍。
 
@@ -931,7 +951,7 @@ def cmd_fixed(store, args):
         append_jsonl(store.fixed, rec)
         conn = store.connect()
         try:
-            index_put(conn, "fixed_fts", "fid", rec["id"], rec["content"])
+            index_put(conn, "fixed_fts", "fid", rec["id"], _index_safe(rec["content"]))
             conn.commit()
         finally:
             conn.close()
@@ -973,7 +993,7 @@ def cmd_hot(store, args):
     append_jsonl(store.hot, rec)
     conn = store.connect()
     try:
-        index_put(conn, "hot_fts", "hid", rec["id"], rec["content"])
+        index_put(conn, "hot_fts", "hid", rec["id"], _index_safe(rec["content"]))
         hot_stats_set(conn, rec["id"], rec["mention_count"], rec["last_mentioned"])
         conn.commit()
     finally:
@@ -1020,7 +1040,9 @@ def rebuild_index(store):
                 if fid in seen["fixed"]:
                     continue
                 seen["fixed"].add(fid)
-                index_put(conn, "fixed_fts", "fid", fid, content)
+                # 索引里的内容是"可被搜到的那份"，必须过入库脱敏；
+                # 否则 rebuild 会把之前洗干净的索引还原成 raw 原文。
+                index_put(conn, "fixed_fts", "fid", fid, _index_safe(content))
                 counts["fixed"] += 1
             for rec in iter_jsonl(store.hot, on_error="warn"):
                 hid = rec.get("id")
@@ -1030,7 +1052,7 @@ def rebuild_index(store):
                 if hid in seen["hot"]:
                     continue
                 seen["hot"].add(hid)
-                index_put(conn, "hot_fts", "hid", hid, content)
+                index_put(conn, "hot_fts", "hid", hid, _index_safe(content))
                 try:
                     mention_count = int(rec.get("mention_count") or 1)
                 except (TypeError, ValueError):
@@ -1050,7 +1072,7 @@ def rebuild_index(store):
                 if bid in seen["reflection"]:
                     continue
                 seen["reflection"].add(bid)
-                index_put(conn, "refl_fts", "bid", bid, content)
+                index_put(conn, "refl_fts", "bid", bid, _index_safe(content))
                 counts["reflection"] += 1
             for rec in iter_cold(store, on_error="warn"):
                 rid = rec.get("id")
@@ -1060,7 +1082,7 @@ def rebuild_index(store):
                 if rid in seen["cold"]:
                     continue
                 seen["cold"].add(rid)
-                index_put(conn, "cold_fts", "rid", rid, content)
+                index_put(conn, "cold_fts", "rid", rid, _index_safe(content))
                 counts["cold"] += 1
             meta_set(conn, "schema_version", SCHEMA_VERSION)
             meta_set(conn, "rebuilt_at", ts_to_iso(now_ts()))
@@ -2581,7 +2603,7 @@ def reflect_add(store, content, about, confidence=0.6):
     append_jsonl(Path(root) / "reflections.jsonl", rec)
     con = _open_db(root)
     try:
-        index_put(con, "refl_fts", "bid", rid, content)
+        index_put(con, "refl_fts", "bid", rid, _index_safe(content))
         con.commit()
     finally:
         con.close()
@@ -2839,8 +2861,9 @@ def _think_index_put(store, tid, text):
     try:
         _think_ensure_table(con)
         con.execute("DELETE FROM thought_fts WHERE tid=?", (tid,))
+        safe = _index_safe(text)
         con.execute("INSERT INTO thought_fts(tid, thought, content) VALUES(?,?,?)",
-                    (tid, text, text))
+                    (tid, safe, safe))
         con.commit()
     finally:
         con.close()
@@ -3234,7 +3257,7 @@ def _event_index_put(store, mid, detail, summary):
         con.execute("DELETE FROM event_fts WHERE mid = ?", (mid,))
         con.execute(
             "INSERT INTO event_fts(mid, detail, summary) VALUES (?, ?, ?)",
-            (mid, detail or "", summary or ""),
+            (mid, _index_safe(detail or ""), _index_safe(summary or "")),
         )
         con.commit()
     finally:
