@@ -738,9 +738,37 @@ try:
     if _SENS_PATH not in sys.path:
         sys.path.insert(0, os.path.dirname(_SENS_PATH))
     from ltm_sensitive import classify as _sens_classify
-except Exception:  # 兜底：找不到模块就按"通过"处理，绝不阻断写入
+    _SENS_AVAILABLE = True
+except Exception:  # 规则模块缺失 —— fail-closed，不是放行
+    # 曾经这里返回 action="ok"（全放行），等于把"防外发"变成摆设：
+    # 密码/手机号会原样进 cold_fts 索引，再被召回到上下文。
+    # 现在退化成"内置最小规则集"：找不到外部模块也不能裸奔。
+    import re as _re
+
+    _SENS_FALLBACK = [
+        (r"\b(?:root|admin|lenora|ubuntu|pi|astrbot)\s*[/:：]\s*[^\s，。、；）)\]】\"']{3,40}", "[已隐去]"),
+        (r"(密码|口令|password|passwd)\s*(?:是|为|[:：=])?\s*[A-Za-z0-9_@#.\-]{4,40}", r"\1 [已隐去]"),
+        (r"sk-[A-Za-z0-9]{12,}", "sk-[已隐去]"),
+        (r"\b1[3-9]\d{9}\b", "[手机号]"),
+    ]
+
     def _sens_classify(text):
-        return {"action": "ok", "kinds": [], "text": text}
+        s = text if isinstance(text, str) else str(text or "")
+        out, kinds = s, []
+        for pat, rep in _SENS_FALLBACK:
+            new = _re.sub(pat, rep, out, flags=_re.I)
+            if new != out:
+                out = new
+                if "redacted" not in kinds:
+                    kinds.append("redacted")
+        if kinds:
+            return {"action": "redact", "kinds": kinds, "text": out}
+        return {"action": "ok", "kinds": [], "text": s}
+
+    _SENS_AVAILABLE = False
+    import logging as _logging
+    _logging.getLogger(__name__).warning(
+        "ltm_sensitive.py 未找到，已启用内置最小脱敏规则（fail-closed）")
 
 
 def sensitive_guard(text):
@@ -2481,7 +2509,9 @@ def reflect_add(store, content, about, confidence=0.6):
     ids = _normalize_ids(about)
     if not ids:
         raise LtmError("about 不能为空，需要至少一个冷层 id")
-    known = set(load_cold_ids(root) or ())
+    # load_cold_ids 内部走 iter_cold，需要 .raw_dir；传 Path 会 AttributeError。
+    # 这里传 Store 对象本身。
+    known = set(load_cold_ids(store) or ())
     missing = [rid for rid in ids if rid not in known]
     if missing:
         raise LtmError("about 中的 id 不在冷层: " + ", ".join(missing[:5]))
@@ -3278,6 +3308,20 @@ def event_add(store, sql, source_ids, topics=None, open_loop=False, importance=0
             ids.append(rid)
     if not ids:
         raise LtmError("event_add: source_ids 不能为空，至少需要一个冷层原话 id")
+
+    # 校验来源 id 真实存在：否则会建出悬空事件（source_ids 指向不存在的原话），
+    # 三档推进、detail 回填、溯源全都指着空气。reflect_add / cmd_import 都校验了，
+    # 只有这个写入口曾经敞着。
+    if conn is None:
+        known_ids = None
+        missing = []
+        for rid in ids:
+            rec = _cold_record(store, rid)
+            if not isinstance(rec, dict):
+                missing.append(rid)
+        if missing:
+            raise LtmError("event_add: source_ids 中存在冷层没有的 id: "
+                           + ", ".join(missing[:5]))
 
     # 事件时间取「这段对话的真实时间」，不是建事件的时钟：
     # 否则 32 天前那一晚会被当成"刚刚发生"，三档生命永远停在 detail。
