@@ -974,6 +974,25 @@ def cmd_fixed(store, args):
 def cmd_hot(store, args):
     """热层操作：add（从冷层 id 派生一条提纯条目）。"""
     store.ensure()
+    if args.hot_cmd == "list":
+        rows = [r for r in iter_jsonl(store.hot, on_error="skip")
+                if isinstance(r, dict) and r.get("id")]
+        conn0 = store.connect()
+        try:
+            for r in rows:
+                st = _hot_stats(conn0, r["id"])
+                mc = _to_int(st.get("mention_count"), None)
+                last = _to_ts(st.get("last_mentioned"), 0)
+                import datetime as _dt
+                when = _dt.datetime.fromtimestamp(last).strftime("%m-%d %H:%M") if last else "-"
+                print("%s\t提及%s\t%s\t%s" % (
+                    when, mc if mc is not None else "-", "未完成" if r.get("open_loop") else "已了",
+                    outbound_scrub((r.get("content") or "")[:60]).replace("\n", " ")))
+        finally:
+            conn0.close()
+        if not rows:
+            print("（热层为空）")
+        return 0
     if args.hot_cmd != "add":
         raise LtmError("未知的 hot 子命令：{0}".format(args.hot_cmd))
     content = (args.content or "").strip()
@@ -2718,6 +2737,21 @@ def cmd_project(store, args):
 
 
 def cmd_reflect(store, args):
+    act = getattr(args, "reflect_cmd", "") or ""
+    if act == "list":
+        rows = [r for r in iter_jsonl(store.reflections, on_error="skip")
+                if isinstance(r, dict) and r.get("id")]
+        import datetime as _dt
+        for r in rows:
+            ts = float(r.get("ts") or 0)
+            when = _dt.datetime.fromtimestamp(ts).strftime("%m-%d %H:%M") if ts else "-"
+            print("%s\tconf=%s\t%s\t%s" % (
+                when, r.get("confidence", "-"), r["id"],
+                outbound_scrub((r.get("content") or "")[:60]).replace("\n", " ")))
+        if not rows:
+            print("（反射层为空）")
+        return 0
+
     content = _cli_arg(args, ("content", "text", "body"), None)
     if not content:
         raise LtmError("reflect 需要 --content")
@@ -3206,9 +3240,18 @@ def cmd_cue(store, args):
     if isinstance(recent, str):
         recent = [recent]
     if not recent:
-        # 插件把最近几条正文从 stdin 递进来，避免命令行转义地狱
+        # 插件把最近几条正文从 stdin 递进来，避免命令行转义地狱。
+        # 注意：管道/子进程里 isatty() 也是 False，直接 read() 会一直阻塞到 EOF。
+        # 所以先看有没有可读数据（select），没有就别读。
         try:
-            if not sys.stdin.isatty():
+            import select as _select
+            has_data = False
+            try:
+                ready, _, _ = _select.select([sys.stdin], [], [], 0)
+                has_data = bool(ready)
+            except Exception:
+                has_data = not sys.stdin.isatty()
+            if has_data:
                 data = sys.stdin.read()
                 if data.strip():
                     recent = [ln for ln in data.splitlines() if ln.strip()]
@@ -3637,6 +3680,7 @@ def build_parser():
     ha.add_argument("--from", dest="from_ids", required=True, help="冷层 id，逗号分隔")
     ha.add_argument("--topics", default="")
     ha.add_argument("--open-loop", action="store_true")
+    hot_sub.add_parser("list", parents=[COMMON], help="列出热层条目")
 
     p = sub.add_parser("reflect", parents=[COMMON], help="反射层操作（第二部分）")
     reflect_sub = p.add_subparsers(dest="reflect_cmd", required=True)
@@ -3644,6 +3688,7 @@ def build_parser():
     ra.add_argument("content")
     ra.add_argument("--about", required=True, help="冷层 id，逗号分隔")
     ra.add_argument("--confidence", type=float, default=0.6)
+    reflect_sub.add_parser("list", parents=[COMMON], help="列出反射层条目")
 
     p = sub.add_parser("recall", parents=[COMMON], help="检索四层记忆（第二部分）")
     p.add_argument("query")
@@ -3703,6 +3748,8 @@ def build_parser():
     esh = ev_sub.add_parser("show", parents=[COMMON], help="看一条事件的三种表示")
     esh.add_argument("mid")
     esh.add_argument("--reveal", action="store_true", help="cold 也吐正文（用户给了线索时用）")
+    el = ev_sub.add_parser("list", parents=[COMMON], help="按时间倒序列出事件")
+    el.add_argument("--k", type=int, default=20)
     ev_sub.add_parser("advance", parents=[COMMON], help="推进阶段并落盘")
     esr = ev_sub.add_parser("search", parents=[COMMON], help="检索事件")
     esr.add_argument("query")
@@ -3733,6 +3780,19 @@ def cmd_event(store, args):
     if act == "advance":
         r = advance_stages(store)
         print(_json.dumps(r, ensure_ascii=False))
+        return 0
+    if act == "list":
+        rows = list(iter_jsonl(_store_events(store), on_error="skip"))
+        rows = [r for r in rows if isinstance(r, dict) and r.get("id")]
+        rows.sort(key=lambda r: float(r.get("ts") or 0), reverse=True)
+        limit = int(getattr(args, "k", 20) or 20)
+        for r in rows[:limit]:
+            import datetime as _dt
+            ts = float(r.get("ts") or 0)
+            when = _dt.datetime.fromtimestamp(ts).strftime("%m-%d %H:%M") if ts else "-"
+            summ = outbound_scrub((r.get("summary") or r.get("detail") or "")[:60])
+            print("%s\t%s\t%s\t%s" % (when, r.get("stage") or "-", r["id"],
+                                        summ.replace("\n", " ")))
         return 0
     if act == "search":
         rows = event_search(store, args.query, k=args.k)
