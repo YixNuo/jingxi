@@ -787,6 +787,22 @@ def sensitive_guard(text):
     return text, True, []
 
 
+def scrub_pack(pack):
+    """给一包召回结果统一脱敏。所有对外返回 pack 的地方都必须调它。
+
+    之所以做成一个函数而不是散落各处：上一版 recall 洗了、project 忘洗，
+    两个函数长得很像、挨着放，光靠人记住"这也要洗"是靠不住的。
+    """
+    if not isinstance(pack, list):
+        return pack
+    for it in pack:
+        if isinstance(it, dict):
+            for field in ("content", "text"):
+                if it.get(field):
+                    it[field] = outbound_scrub(it[field])
+    return pack
+
+
 def outbound_scrub(text):
     """出口脱敏：任何要交给调用方/模型看的正文，都从这里过一遍。
 
@@ -2465,9 +2481,7 @@ def recall(store, query, budget_tokens=1200, k=10, layers=None, reveal=False):
 
     # 出口脱敏：cold 正文来自 raw 原文，入库时洗过索引但没洗正文，
     # 这里必须再过一遍，否则召回输出就是把密码直接递给模型。
-    for it in pack:
-        if isinstance(it, dict) and it.get("content"):
-            it["content"] = outbound_scrub(it["content"])
+    scrub_pack(pack)
 
     _touch_hot(root, pack)
     meta["dropped"] = dropped
@@ -2492,6 +2506,10 @@ def project(store, query, token_budget=1200, k=10):
 
     cands, meta = _recall_candidates(root, text, top_k, None)
     pack, used, removed_dup, truncated, dropped = _pack_projection(cands, budget)
+
+    # 出口脱敏（和 recall 同一道闸）。这里曾经漏了：recall 洗、project 没洗。
+    scrub_pack(pack)
+
     _touch_hot(root, pack)
     meta["dropped"] = dropped
     return {
