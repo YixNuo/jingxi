@@ -2446,6 +2446,43 @@ def recall(store, query, budget_tokens=1200, k=10, layers=None, reveal=False):
     # 剥空了就退回原串（比如用户只说了"那次"）。
     probe = _strip_cue(text)
 
+    # 别名扩展：用户口中的称呼（宝/鱼宝/灵枢……）换成规范名再检索一遍。
+    # 只做单向展开（alias -> canonical），不反向传递，避免"用户"被当成"宝"到处撞。
+    alias_terms = []
+    try:
+        store_a = root if isinstance(root, Store) else Store(root)
+        conn_a = store_a.connect()
+        try:
+            # 先按分隔符切；每段再生成 2-4 字滑窗（中文没有空格，长句里的别名只能靠滑窗捞）
+            toks = []
+            for seg in re.split(r"[\s，。、！？,.!?]+", text):
+                seg = seg.strip()
+                if not seg:
+                    continue
+                toks.append(seg)
+                if len(seg) <= 12:
+                    for i in range(len(seg)):
+                        for n in (2, 3, 4):
+                            if i + n <= len(seg):
+                                toks.append(seg[i:i + n])
+                else:
+                    for i in range(len(seg)):
+                        for n in (2, 3, 4, 5, 6):
+                            if i + n <= len(seg):
+                                toks.append(seg[i:i + n])
+            for tok in toks:
+                if not tok or len(tok) > 12:
+                    continue
+                row = conn_a.execute(
+                    "SELECT canonical FROM alias WHERE alias = ? LIMIT 1", (tok,)
+                ).fetchone()
+                if row and row[0] and row[0] not in alias_terms:
+                    alias_terms.append(str(row[0]))
+        finally:
+            conn_a.close()
+    except Exception:
+        alias_terms = []
+
     cands, meta = _recall_candidates(root, text, top_k, layers)
 
     # 思考层：想过的事也随事一起回来。
@@ -2480,6 +2517,25 @@ def recall(store, query, budget_tokens=1200, k=10, layers=None, reveal=False):
             if str(c.get("id")) not in seen:
                 cands.append(c)
         cands.sort(key=lambda it: (-it["score"], it["id"]))
+
+    # 别名扩展的结果：分数打个折，只当补充，不抢原词的位置。
+    if alias_terms:
+        seen = {str(c.get("id")) for c in cands}
+        for term in alias_terms:
+            try:
+                extra2, _ = _recall_candidates(root, term, top_k, layers)
+            except Exception:
+                continue
+            for c in extra2:
+                cid = str(c.get("id"))
+                if cid in seen:
+                    continue
+                c["score"] = float(c.get("score") or 0) * 0.6
+                c["note"] = (c.get("note") or "") + ("（别名：" + term + "）" if c.get("note") else "别名：" + term)
+                cands.append(c)
+                seen.add(cid)
+        cands.sort(key=lambda it: (-it["score"], it["id"]))
+
 
     # 候选侧：纯问句降权（"你还记得吗"这种不是记忆内容）
     for c in cands:
