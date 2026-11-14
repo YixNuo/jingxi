@@ -2536,7 +2536,6 @@ def recall(store, query, budget_tokens=1200, k=10, layers=None, reveal=False):
                 seen.add(cid)
         cands.sort(key=lambda it: (-it["score"], it["id"]))
 
-
     # 候选侧：纯问句降权（"你还记得吗"这种不是记忆内容）
     for c in cands:
         if _is_plain_question(c.get("content")):
