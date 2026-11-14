@@ -2205,15 +2205,17 @@ def _recall_candidates(root, query, k, layers):
     # 那种情况正是语义该出手的时候。
     top_score = max((float(it.get("score") or 0) for it in fused.values()), default=0.0)
     lexical_strong = top_score >= 0.05
-    if lexical_strong:
-        vec_hits = {}
+    # 向量不是备胎：词法强的时候仍然参与打分，只是权重收敛。
+    # 当初的设计是两条腿并联（词法管精确、向量管同义），
+    # 写成"词法一命中就关掉向量"等于把换词能力关掉了。
+    vec_weight = 0.6 if not lexical_strong else 0.35
 
     if vec_hits:
         # 已有的候选：向量相似度越高，分数乘得越大（最多 2.5 倍）
         for it in fused.values():
             sc = vec_hits.get(str(it["id"]))
             if sc:
-                it["score"] = float(it["score"]) * (1.0 + 0.6 * float(sc))
+                it["score"] = float(it["score"]) * (1.0 + vec_weight * float(sc))
                 it["vec_score"] = round(float(sc), 4)
         # 词法没捞到、但向量很自信的：补进来（只补摘要和冷层）
         # 补进来的候选必须有字面交集：纯语义近邻容易把"加载到显卡"拉进来
@@ -2227,7 +2229,8 @@ def _recall_candidates(root, query, k, layers):
             if q_grams and not any(g in body for g in q_grams):
                 continue
             sc = vec_hits.get(iid, 0.0)
-            it["score"] = 0.02 * (1.0 + 0.6 * float(sc))
+            # 靠语义补进来的候选要有分量，否则"捞对了也排不上去"。
+            it["score"] = 0.02 * (1.0 + vec_weight * float(sc)) + 0.010
             it["vec_score"] = round(float(sc), 4)
             fused[iid] = it
 
